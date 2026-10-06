@@ -3079,6 +3079,14 @@ function defaultChaoticTrigParams() {
 // per-instance color picker. These mirror dedColor / indColor below.
 const DEFAULT_DED_HEX = '#4a8bdd';
 const DEFAULT_IND_HEX = '#d87a3d';
+// Instance colors are interpolated into card / equation-panel HTML, and can
+// arrive from a loaded project file, so accept only #rgb / #rrggbb.
+function safeHex(c, fallback) {
+  const m = /^#?([0-9a-f]{6}|[0-9a-f]{3})$/i.exec(String(c ?? '').trim());
+  if (!m) return fallback;
+  const h = m[1].length === 3 ? m[1].replace(/./g, ch => ch + ch) : m[1];
+  return '#' + h.toLowerCase();
+}
 function defaultTrack() {
   return {
     on: false,
@@ -3132,7 +3140,7 @@ function makeInstance(kind, opts = {}) {
     expressions: isPrimary ? null : (opts.expressions ? { ...opts.expressions } : {}),
     // Per-instance render color (hex). Defaults per kind; user can edit
     // via the color picker in the card head.
-    color: opts.color || (isDed ? DEFAULT_DED_HEX : (isChaos ? DEFAULT_IND_HEX : DEFAULT_IND_HEX)),
+    color: safeHex(opts.color, isDed ? DEFAULT_DED_HEX : DEFAULT_IND_HEX),
     pathGroup: new THREE.Group(),
     trackGroup: new THREE.Group(),
     track: opts.track ? { ...defaultTrack(), ...opts.track, history: [] } : defaultTrack(),
@@ -4495,7 +4503,9 @@ function renderInstanceName(inst) {
   if (!card) return;
   const nameEl = card.querySelector('.inst-name');
   if (!nameEl) return;
-  const baseName = `${inst.kind === 'ded' ? 'Deductive' : 'Inductive'} · ${String(inst.id).padStart(2,'0')}`;
+  const kindLabel = inst.kind === 'ded' ? 'Deductive'
+    : (inst.step_rule === 'parametric' ? 'Chaotic' : 'Inductive');
+  const baseName = `${kindLabel} · ${String(inst.id).padStart(2,'0')}`;
   nameEl.textContent = inst.csvLabel ? `${baseName} · ${inst.csvLabel}` : baseName;
 }
 
@@ -5235,7 +5245,7 @@ function buildInstanceCardHTML(inst) {
         <div class="field">
           <label>Fade variation</label>
           <span class="val mono num" id="track_fade_var_resolved__${sx}">+0.00</span>
-          <input type="text" id="track_fade_var__${sx}" value="${inst.track.fadeVarExpr}" class="freeinput trk-expr" placeholder="0   ·   accepts l, m, n, p, q, r, c, d" />
+          <input type="text" id="track_fade_var__${sx}" value="${escHtml(inst.track.fadeVarExpr)}" class="freeinput trk-expr" placeholder="0   ·   accepts l, m, n, p, q, r, c, d" />
         </div>
         <div class="trk-help">+ darker · 0 uniform · − lighter (saturates at ±1)</div>
       </div>
@@ -5590,7 +5600,12 @@ function loadCSVForKind(kind, file) {
     for (let i = 1; i < rows.length; i++) {
       try {
         const { params, label } = csvRowToParams(kind, header, rows[i], i + 1);
-        const inst = makeInstance(kind, { params });
+        // Chaotic rows may omit optional columns (older exports); fill the
+        // gaps from defaults so e.g. a missing show_points doesn't hide the cloud.
+        const full = kind === 'chaos'
+          ? { ...defaultChaoticTrigParams(), preset: '', ...params }
+          : params;
+        const inst = makeInstance(kind, { params: full });
         if (label) inst.csvLabel = label;
         appendSecondaryCard(inst);
         // Refresh the card label to include the csvLabel suffix (handled
@@ -5848,7 +5863,7 @@ function serializeInstance(inst) {
     track: inst.track ? {
       on: inst.track.on,
       max: inst.track.max,
-      fadeVar: inst.track.fadeVar,
+      fadeVarExpr: inst.track.fadeVarExpr,
       fadeVarValue: inst.track.fadeVarValue,
     } : null,
   };
@@ -6145,12 +6160,6 @@ function clearCanvas() {
   setTimeout(() => note.remove(), 1100);
 }
 
-// Wire clear button (added in toolbar)
-setTimeout(() => {
-  const clr = document.getElementById('btn_clear');
-  if (clr) clr.addEventListener('click', clearCanvas);
-}, 10);
-
 // Autosave (localStorage) — DEFAULT OFF (opt-in via clicking status). User can enable for session persistence.
 const AUTOSAVE_KEY = 'rp_project_v7_autosave';
 const AUTOSAVE_PREF_KEY = 'rp_autosave_enabled';
@@ -6260,12 +6269,6 @@ console.log('%c[RP v8] Project system + greatly expanded Surprise engine ready',
 // ============================================================================
 // End v7 project system
 // ============================================================================
-
-// buttons
-document.getElementById('btn_reseed').addEventListener('click', () => {
-  state.seed = Math.floor(Math.random() * 0xffffff);
-  regenerate();
-});
 
 // buttons
 document.getElementById('btn_reseed').addEventListener('click', () => {
@@ -6651,11 +6654,13 @@ function buildComplexChaoticExpressions(sceneType) {
       {name: 'k', expr: `${r(1.8,3.0)}*cos(i/${ri(13,23)} + t*0.6)`},
       {name: 'l', expr: `i/${ri(160,240)} * ${r(0.9,1.6)}`},
       {name: 'q', expr: `sin(k*1.8 + l + t*0.5) * ${r(1.4,2.2)} + cos(l*2.7) * ${r(0.35,0.75)}`},
-      {name: 'm', expr: `sin(q*0.9 + k*0.6 + t) * ${r(0.7,1.3)}`},
+      // 'g', not 'm': m is the reserved per-form phase input, and a def
+      // named m fails chaoticCompile() and renders nothing.
+      {name: 'g', expr: `sin(q*0.9 + k*0.6 + t) * ${r(0.7,1.3)}`},
     ];
-    x = `(q + m*0.8) * cos(l*1.65 + t)`;
-    y = `(q - m*0.6) * sin(l*1.65 + t)`;
-    z = `sin(q*1.35 + t*0.4) * cos(k + m) * 0.95`;
+    x = `(q + g*0.8) * cos(l*1.65 + t)`;
+    y = `(q - g*0.6) * sin(l*1.65 + t)`;
+    z = `sin(q*1.35 + t*0.4) * cos(k + g) * 0.95`;
   }
 
   return { defs, x, y, z };
@@ -7148,7 +7153,8 @@ function renderWalkInstance(inst) {
       b.classList.add('on');
       inst.direction = b.dataset.val;
       // re-anchor owned params so switching mid-run feels right
-      Object.keys(inst.anchor).forEach(p => { if (walkOwnership.get(p) === inst.id) inst.anchor[p] = state[p]; });
+      // readParam (not state[p]) so var_* params re-anchor to state.vars.
+      Object.keys(inst.anchor).forEach(p => { if (walkOwnership.get(p) === inst.id) inst.anchor[p] = readParam(p); });
     });
   });
   root.appendChild(dirRow);
@@ -7276,8 +7282,10 @@ function startInstance(inst) {
     masterSnapshot = JSON.parse(JSON.stringify(state));
     // Also snapshot every secondary instance's params so a "Reset all" restores them.
     masterSnapshot.__secondaries = {
-      ded: dedInstances.slice(1).map(i => ({ id: i.id, params: { ...i.params } })),
-      ind: indInstances.slice(1).map(i => ({ id: i.id, params: { ...i.params } })),
+      // Skip the primary by flag, not by slot: if the primary card was
+      // deleted, slot 0 holds a secondary that must be snapshotted too.
+      ded: dedInstances.filter(i => !i.isPrimary).map(i => ({ id: i.id, params: { ...i.params } })),
+      ind: indInstances.filter(i => !i.isPrimary).map(i => ({ id: i.id, params: { ...i.params } })),
     };
   }
   // resume vs fresh start: if we still hold ownership of any param, we're resuming
@@ -9956,6 +9964,7 @@ mountWalkPanel();
     try { return !!localStorage.getItem(POS_PREFIX + id); } catch (_) { return false; }
   }
 
+  const chaosPanel = document.getElementById('chaos_panel');
   const dedPanel = document.getElementById('ded_panel');
   const indPanel = document.getElementById('ind_panel');
   const readoutPanel = document.getElementById('readout_panel');
@@ -9964,8 +9973,12 @@ mountWalkPanel();
   const beyondPanel  = document.getElementById('beyond_panel');
 
   // Only apply canned first-run positions if the user has never dragged that panel.
-  if (dedPanel && !hasSaved('ded_panel'))     { dedPanel.style.left  = '24px';  dedPanel.style.top  = '156px'; }
-  if (indPanel && !hasSaved('ind_panel'))     { indPanel.style.left  = '24px';  indPanel.style.top  = '500px'; }
+  // Left column, top to bottom: Chaotic (short: just its action buttons),
+  // Deductive, Inductive. Chaotic previously had no default position and
+  // landed on top of the Deductive panel's + Add / Duplicate / CSV row.
+  if (chaosPanel && !hasSaved('chaos_panel')) { chaosPanel.style.left = '24px';  chaosPanel.style.top = '156px'; }
+  if (dedPanel && !hasSaved('ded_panel'))     { dedPanel.style.left  = '24px';  dedPanel.style.top  = '370px'; }
+  if (indPanel && !hasSaved('ind_panel'))     { indPanel.style.left  = '24px';  indPanel.style.top  = '640px'; }
 
   const rightX = Math.max(360, window.innerWidth - 24 - 320);
   if (readoutPanel && !hasSaved('readout_panel')) { readoutPanel.style.left = rightX + 'px'; readoutPanel.style.top = '156px'; }

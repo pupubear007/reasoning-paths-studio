@@ -24,7 +24,7 @@ The review covers `RP_Walk_parametric_v9.html` from `pupubear007/RPwalk`, which 
 | 8 | Low | Renaming a Chaotic card relabelled it "Inductive · NN". |
 | 9 | Low | Reseed and Clear canvas each had two click listeners. |
 
-## Fixed in the follow-up (branch `claude/bold-fermat-sua9vx`)
+## Fixed in follow-up work
 
 | Former open item | Change |
 |---|---|
@@ -35,6 +35,7 @@ The review covers `RP_Walk_parametric_v9.html` from `pupubear007/RPwalk`, which 
 | Line overlay reallocated every frame | Updated in place. |
 | A cloned sphere mesh per path marker | One `InstancedMesh` per path. |
 | No upper bound on steps / iterations | Capped at 5,000 points per path and 200,000 Chaotic iterations. |
+| `resize()` missed track and Beyond line widths | Every `LineMaterial` in the scene gets the new resolution. |
 
 ## Still open (not changed)
 
@@ -43,21 +44,20 @@ These need design decisions or bigger edits than a review-fix commit should make
 ### Correctness
 
 1. **The first-run welcome scene is dead code** (line 10158). The guard `instances > 1` is always true at boot because two primaries exist. If it ever ran, it would also append the card *before* setting the params, so the card would show jellyfish defaults while the scene showed something else.
-2. **`resize()` (line 3813) only updates `LineMaterial.resolution` under `dedGroup` and `indGroup`.** Movement tracks (`tracksRoot`) and Beyond parametric curves keep the old resolution, so their line widths are off after a window resize until rebuilt.
-3. **"attractor_garden" Surprise scenes fall far outside the ±2 cube.** `y = b*1.55 + dy*55` with `dy ≈ a·(22…34)·0.028` gives |y| of about 40–60.
-4. Minor parser leniency: `1.2.3` parses as `1.2`, and one-argument functions silently ignore a second argument (`sin(1, 2)`).
+2. **"attractor_garden" Surprise scenes fall far outside the ±2 cube.** `y = b*1.55 + dy*55` with `dy ≈ a·(22…34)·0.028` gives |y| of about 40–60.
+3. Minor parser leniency: `1.2.3` parses as `1.2`, and one-argument functions silently ignore a second argument (`sin(1, 2)`).
 
 ### Performance
 
-5. **The Beyond variable watcher polls `state.vars` every 250 ms** (line 9920) and rebuilds *all* Beyond objects, including marching cubes (up to 81³ interpreted evaluations) and volumes, whenever any variable changes, for example during a `var_*` walk.
+4. **The Beyond variable watcher polls `state.vars` every 250 ms** (line 9920) and rebuilds *all* Beyond objects, including marching cubes (up to 81³ interpreted evaluations) and volumes, whenever any variable changes, for example during a `var_*` walk.
 
 ### Maintainability
 
-6. **Dead code:** `generateCreativeExpressions`, `POETIC_NAMES`, `getPoeticName` and `generateSurpriseColor` (about 150 lines from line 6748), `drawMini`, `parseUnary`, `findInstance`, and the vestigial `state.animateParam` / `paramT`. The legacy `generateCreativeExpressions` also uses the reserved names `t` and `m`.
-7. **Monkey-patching by reassigning function declarations** (`regenerate`, `animate`, `renderEquationsPanel`, `recomputeAllSecondaryExpressions`) works, but makes it hard to follow what runs. An explicit hook list would be clearer.
-8. **The primary/secondary split** (primary params live in `state`, with bare DOM ids and static markup) causes most of the bugs above and the duplicated card-building code. Building the primary cards dynamically, with a `params` object like every other instance, would remove the `*PrimaryDisposed` flags and most of the "skip primary by flag" special cases.
-9. **Card HTML is grouped by splitting a template string on `'</div>'`** (`buildInstanceCardHTML`). This breaks as soon as a field row gains a nested `div`.
-10. **The volume shader's opacity correction** `pow(1 - a, dt*steps*0.5)` is constant per ray, not per step, so it doesn't make opacity independent of step count as the comment claims.
+5. **Dead code:** `generateCreativeExpressions`, `POETIC_NAMES`, `getPoeticName` and `generateSurpriseColor` (about 150 lines from line 6748), `drawMini`, `parseUnary`, `findInstance`, and the vestigial `state.animateParam` / `paramT`. The legacy `generateCreativeExpressions` also uses the reserved names `t` and `m`.
+6. **Monkey-patching by reassigning function declarations** (`regenerate`, `animate`, `renderEquationsPanel`, `recomputeAllSecondaryExpressions`) works, but makes it hard to follow what runs. An explicit hook list would be clearer.
+7. **The primary/secondary split** (primary params live in `state`, with bare DOM ids and static markup) causes most of the bugs above and the duplicated card-building code. Building the primary cards dynamically, with a `params` object like every other instance, would remove the `*PrimaryDisposed` flags and most of the "skip primary by flag" special cases.
+8. **Card HTML is grouped by splitting a template string on `'</div>'`** (`buildInstanceCardHTML`). This breaks as soon as a field row gains a nested `div`.
+9. **The volume shader's opacity correction** `pow(1 - a, dt*steps*0.5)` is constant per ray, not per step, so it doesn't make opacity independent of step count as the comment claims.
 
 ## Tests added
 

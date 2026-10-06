@@ -28,7 +28,11 @@ It is built on [three.js](https://threejs.org/) r160 and ships as one self-conta
 | **Walk** panel | Random walks over any set of parameters or variables, run all at once or in turn. Turn on a card's *Movement track* to keep ghost trails of past frames. |
 | **Equations** panel | A read-only symbolic readout of every instance, with ƒx expressions and their resolved values. |
 | **Beyond paths** panel | Curves, surfaces, vector fields and volumes. All accept the same expression syntax, including the shared variables. |
-| Toolbar | Reseed, grid/axes/shadow toggles, zoom, auto-orbit, PNG export, project save/load (JSON), **✧ Surprise me**, and clear canvas. Click the *autosave* label to turn on autosave: the session is then saved to this browser and reopened the next time you load the page. |
+| Toolbar | Reseed, grid/axes/shadow toggles, zoom, auto-orbit, **↶ undo / ↷ redo** (Ctrl/⌘+Z, Ctrl/⌘+Shift+Z), PNG export, project save/load (JSON), **🔗 share link**, **✧ Surprise me**, and clear canvas. Click the *autosave* label to turn on autosave: the session is then saved to this browser and reopened the next time you load the page. |
+
+### Sharing a scene
+
+Click **🔗** to copy a link that contains the whole scene (instances, variables, expressions, Beyond objects and display settings), compressed into the URL fragment. Opening the link recreates the scene. The fragment is never sent to a server, so links work from GitHub Pages and from a local copy alike. Shared scenes are treated as untrusted input: every value is type-checked and capped before it's used.
 
 ### Expression syntax
 

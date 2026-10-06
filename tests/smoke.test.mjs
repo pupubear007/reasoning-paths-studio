@@ -192,3 +192,92 @@ test('animating a Chaotic cloud with the line overlay updates in place', async (
   await click(`[data-chaotic-play="${cx}"]`);
   assert.deepEqual(errors, []);
 });
+
+// ---------- Undo / redo ----------
+
+const settle = () => page.waitForTimeout(700);   // history captures 400 ms after edits
+
+test('undo and redo step through scene edits', async () => {
+  await settle();
+  const start = await countCards();
+  await click('#btn_ded_add');
+  await settle();
+  await click('#btn_ind_add');
+  await settle();
+  assert.deepEqual(await countCards(), { ...start, ded: start.ded + 1, ind: start.ind + 1 });
+
+  await click('#btn_undo');
+  assert.deepEqual(await countCards(), { ...start, ded: start.ded + 1 });
+  await page.$eval('body', b => b.focus());
+  await page.keyboard.press('Control+z');
+  assert.deepEqual(await countCards(), start);
+  await page.keyboard.press('Control+Shift+z');
+  assert.deepEqual(await countCards(), { ...start, ded: start.ded + 1 });
+  await click('#btn_redo');
+  assert.deepEqual(await countCards(), { ...start, ded: start.ded + 1, ind: start.ind + 1 });
+  assert.equal(await page.$eval('#btn_redo', b => b.disabled), true);
+
+  // A new edit after undo drops the redo branch.
+  await click('#btn_undo');
+  await click('#btn_chaos_add');
+  await settle();
+  assert.equal(await page.$eval('#btn_redo', b => b.disabled), true);
+  assert.deepEqual(errors, []);
+});
+
+// ---------- Shareable links ----------
+
+test('a shared link reproduces the scene', async () => {
+  const sx = await page.$eval('#ded_instances_host .inst-card:last-child', c => 'd' + c.dataset.instId);
+  await page.$eval(`#start_x__${sx}`, el => { el.value = '-1.3'; el.dispatchEvent(new Event('input')); });
+  const expected = await countCards();
+  await click('#btn_share');
+  await page.waitForSelector('#share_url');
+  const url = await page.inputValue('#share_url');
+  assert.match(url, /#scene=[A-Za-z0-9_-]+$/);
+
+  // Fresh page load from the link.
+  await page.goto('about:blank');
+  await page.goto(url);
+  await page.waitForFunction(() => (+document.body.dataset.projectLoads || 0) > 0, null, { polling: 100 });
+  assert.deepEqual(await countCards(), expected);
+  assert.equal(await page.inputValue(`#start_x__${sx}`), '-1.3');
+  assert.equal(new URL(page.url()).hash, '');            // fragment consumed
+  assert.deepEqual(errors, []);
+});
+
+test('a hostile shared link is sanitized', async () => {
+  const { deflateRawSync } = await import('node:zlib');
+  const evil = '"><img src=x onerror="window.__pwned=1">';
+  const project = {
+    format: 'reasoning-paths-project', version: 8,
+    state: { x_inc: 'abc', steps: '9e99', showGrid: evil, vars: { l: evil, m: 2 } },
+    instances: {
+      ded: [{ id: 1, params: { start_x: evil, steps: 3, ded_polarity: evil },
+              color: `red${evil}`, csvLabel: evil,
+              expressions: { 'start_x"]': 'l', z_inc: 'm*0.1', bogus: 'l' },
+              track: { on: true, max: evil, fadeVarExpr: evil } }],
+      ind: [{ id: 'x', params: { sigma: {} }, color: '#abc' }],
+      chaos: [{ id: 2, params: { defs: [{ name: evil, expr: evil }, null], x_expr: evil,
+                                 iterations: evil, preset: evil }, color: '#00ff00' }],
+    },
+    beyond: { param: [{ params: { t_min: 'x', samples: evil, name: evil, color: evil } }],
+              volume: [{ params: { center: [evil], grid: 8 } }] },
+  };
+  const enc = deflateRawSync(Buffer.from(JSON.stringify(project))).toString('base64url');
+  const base = page.url().split('#')[0];
+  const loads = await page.evaluate(() => +document.body.dataset.projectLoads || 0);
+  await page.goto(base + '#scene=' + enc);              // same document: hashchange path
+  await page.waitForFunction(n => (+document.body.dataset.projectLoads || 0) > n, loads, { polling: 100 });
+  assert.equal(await page.evaluate(() => window.__pwned), undefined);
+  assert.equal(await page.$('img[onerror]'), null);
+  assert.deepEqual(await countCards(), { ded: 1, ind: 1, chaos: 1 });
+  assert.equal(await page.inputValue('#steps__d1'), '3');
+  // A walk over a parameter whose saved value was junk must stay numeric.
+  await click('#btn_walk_all');
+  await page.waitForTimeout(500);
+  await click('#btn_walk_all');
+  const zinc = Number(await page.inputValue('#z_inc__d1'));
+  assert.ok(Number.isFinite(zinc));
+  assert.deepEqual(errors, []);
+});

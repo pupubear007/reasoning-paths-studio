@@ -345,6 +345,23 @@
   }
   .icon-btn:hover { background: var(--ink); color: var(--paper); border-color: var(--ink); }
   .icon-btn.on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .icon-btn:disabled { opacity: 0.35; cursor: default; }
+  .icon-btn:disabled:hover { background: rgba(255,255,255,0.04); color: var(--ink-2); border-color: var(--rule); }
+  /* Share-link popover under the toolbar. */
+  .share-pop {
+    position: fixed; z-index: 99999; right: 20px; top: 190px; width: min(460px, calc(100vw - 40px));
+    background: var(--paper-2); color: var(--ink-2); border: 1px solid var(--rule); border-radius: 4px;
+    padding: 10px 12px; font: 12px 'DM Sans', system-ui, sans-serif; box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+  }
+  .share-pop .row { display: flex; gap: 6px; margin-top: 8px; }
+  .share-pop input {
+    flex: 1; min-width: 0; font: 11px 'JetBrains Mono', monospace; color: var(--ink);
+    background: rgba(0,0,0,0.25); border: 1px solid var(--rule); border-radius: 3px; padding: 5px 6px;
+  }
+  .share-pop button {
+    font: 11px 'JetBrains Mono', monospace; color: var(--ink-2); background: transparent;
+    border: 1px solid var(--rule); border-radius: 3px; padding: 4px 8px; cursor: pointer;
+  }
   /* Per-instance ▶ t button on Chaotic cards. Sits in the card head between
      color and rename. Wider than the icon-btns because it carries glyph+letter,
      and uses the same on/off visual language as the other card-head toggles. */
@@ -1803,10 +1820,13 @@
         <button class="icon-btn" id="btn_zoom_out" title="Zoom out">−</button>
         <button class="icon-btn" id="btn_anim" title="Play (camera orbit)">▶</button>
         <button class="icon-btn" id="btn_reset" title="Reset camera">⟲</button>
+        <button class="icon-btn" id="btn_undo" title="Undo (Ctrl/⌘ + Z)" disabled>↶</button>
+        <button class="icon-btn" id="btn_redo" title="Redo (Ctrl/⌘ + Shift + Z)" disabled>↷</button>
 
         <!-- v8 Project controls -->
         <button class="icon-btn" id="btn_project_save" title="Save full project (JSON)" style="background:rgba(80,140,90,0.15);border-color:#3a5a3a">⤓</button>
         <button class="icon-btn" id="btn_project_load" title="Load full project (JSON)" style="background:rgba(80,140,90,0.15);border-color:#3a5a3a">⤒</button>
+        <button class="icon-btn" id="btn_share" title="Copy a link to this scene" style="background:rgba(80,140,90,0.15);border-color:#3a5a3a">🔗</button>
         <button class="icon-btn" id="btn_surprise" title="Surprise me — complex generative scene" style="background:rgba(120,90,160,0.2);border-color:#664477">✧</button>
         <button class="icon-btn" id="btn_clear" title="Clear canvas — remove all paths and reset" style="background:rgba(180,80,80,0.15);border-color:#5a3a3a">✕</button>
         <span id="autosave_status" class="mono" style="font-size:10px;opacity:0.45;margin-left:4px;align-self:center;cursor:pointer;" title="Click to toggle autosave (default off)">autosave off</span>
@@ -3136,6 +3156,43 @@ function safeHex(c, fallback) {
   const h = m[1].length === 3 ? m[1].replace(/./g, ch => ch + ch) : m[1];
   return '#' + h.toLowerCase();
 }
+// Track settings can come from a project file or shared link; keep only
+// well-formed values (max is printed into card HTML).
+function sanitizeTrack(t) {
+  const d = defaultTrack();
+  if (!t || typeof t !== 'object') return d;
+  return {
+    ...d,
+    on: !!t.on,
+    max: t.max == null ? d.max : clampCount(t.max, 2000),
+    fadeVarExpr: typeof t.fadeVarExpr === 'string' ? t.fadeVarExpr : d.fadeVarExpr,
+  };
+}
+
+// Merge `loaded` over `defaults`, keeping a loaded value only when it has
+// the same type as the default (numbers may arrive as numeric strings).
+// Unknown keys are dropped. Used for everything read from project files
+// and shared links, which are untrusted input.
+function typedMerge(defaults, loaded) {
+  const out = { ...defaults };
+  if (!loaded || typeof loaded !== 'object') return out;
+  for (const [k, d] of Object.entries(defaults)) {
+    const v = loaded[k];
+    if (v === undefined || v === null) continue;
+    if (typeof d === 'number') {
+      const n = Number(v);
+      if (Number.isFinite(n)) out[k] = n;
+    } else if (typeof d === 'boolean') {
+      out[k] = !!v;
+    } else if (typeof d === 'string') {
+      if (typeof v === 'string' || typeof v === 'number') out[k] = String(v);
+    } else if (Array.isArray(d)) {
+      if (Array.isArray(v)) out[k] = v;
+    }
+  }
+  return out;
+}
+
 function defaultTrack() {
   return {
     on: false,
@@ -3192,7 +3249,7 @@ function makeInstance(kind, opts = {}) {
     color: safeHex(opts.color, isDed ? DEFAULT_DED_HEX : DEFAULT_IND_HEX),
     pathGroup: new THREE.Group(),
     trackGroup: new THREE.Group(),
-    track: opts.track ? { ...defaultTrack(), ...opts.track, history: [] } : defaultTrack(),
+    track: opts.track ? sanitizeTrack(opts.track) : defaultTrack(),
     // for the secondary cards' DOM ids: e.g., 'x_inc__d2', 'theta_inc__i3'
     suffix: '',  // primary has empty suffix (uses bare ids); will be set below for secondaries
     // Parametric live-render handles (filled by buildChaoticLive). Held on
@@ -3816,10 +3873,10 @@ function resize() {
   renderer.setSize(w, h, false);
   camera.aspect = w/h;
   camera.updateProjectionMatrix();
-  // update line materials resolution
-  [dedGroup, indGroup].forEach(g => g.traverse(obj => {
+  // update line materials resolution (paths, tracks and Beyond curves)
+  scene.traverse(obj => {
     if (obj.material && obj.material.resolution) obj.material.resolution.set(w, h);
-  }));
+  });
 }
 
 // FPS counter
@@ -5992,21 +6049,38 @@ function reserveInstanceId(kind, id) {
 // lived in the top-level state); those are rebuilt from project.state so
 // every loaded instance is an ordinary, self-contained card.
 function instanceOptsFromSave(kind, data, savedState) {
+  const keys = kind === 'ded' ? DED_PARAM_KEYS : IND_PARAM_KEYS;
   let params = data.params;
-  let expressions = data.expressions || {};
-  if (data.isPrimary || !params) {
-    const keys = kind === 'ded' ? DED_PARAM_KEYS : IND_PARAM_KEYS;
+  let expressions = data.expressions;
+  if (data.isPrimary || !params || typeof params !== 'object') {
     params = {};
     for (const k of keys) if (savedState && k in savedState) params[k] = savedState[k];
-    const prim = (savedState && savedState.expressions) || {};
-    expressions = Object.fromEntries(Object.entries(prim).filter(([k]) => keys.includes(k)));
+    expressions = savedState && savedState.expressions;
   }
-  const defaults = kind === 'ded' ? defaultDedParams()
-    : kind === 'chaos' ? { ...defaultChaoticTrigParams(), preset: '' }
-    : defaultIndParams();
+  // ƒx maps: only real parameter keys with string sources (keys end up in
+  // DOM ids and CSS selectors).
+  expressions = Object.fromEntries(Object.entries(
+    expressions && typeof expressions === 'object' ? expressions : {}
+  ).filter(([k, v]) => keys.includes(k) && typeof v === 'string'));
+
+  let merged;
+  if (kind === 'chaos') {
+    merged = typedMerge({ ...defaultChaoticTrigParams(), preset: '' }, params);
+    // defs: an array of { name, expr } strings; very old saves only have
+    // the fixed k_expr…c_expr keys.
+    const rawDefs = Array.isArray(params.defs) ? params.defs : chaosDefsFromLegacy(params);
+    merged.defs = rawDefs
+      .filter(d => d && typeof d === 'object')
+      .map(d => ({ name: String(d.name ?? ''), expr: String(d.expr ?? '') }));
+    if (!(merged.preset in CHAOTIC_PRESETS)) merged.preset = '';
+  } else {
+    merged = typedMerge(kind === 'ded' ? defaultDedParams() : defaultIndParams(), params);
+    if (kind === 'ded' && !VALID_DED_POL.has(merged.ded_polarity)) merged.ded_polarity = 'up';
+    if (kind !== 'ded' && !VALID_IND_POL.has(merged.ind_polarity)) merged.ind_polarity = 'positive';
+  }
   return {
     color: data.color,
-    params: { ...defaults, ...params },
+    params: merged,
     expressions,
     track: data.track || undefined,
   };
@@ -6041,10 +6115,12 @@ function loadFullProject(project) {
   // running walks left over from before.
   resetScene();
 
-  const saved = project.state || {};
-  for (const k of RESTORABLE_STATE_KEYS) {
-    if (k in saved) state[k] = saved[k];
-  }
+  const saved = (project.state && typeof project.state === 'object') ? project.state : {};
+  // resetScene() left defaults in `state`; take saved values of the same type.
+  Object.assign(state, typedMerge(
+    Object.fromEntries(RESTORABLE_STATE_KEYS.map(k => [k, state[k]])), saved));
+  if (!VALID_DED_POL.has(state.ded_polarity)) state.ded_polarity = 'up';
+  if (!VALID_IND_POL.has(state.ind_polarity)) state.ind_polarity = 'positive';
   if (!Number.isInteger(state.seed)) state.seed = 0x42a1;
   if (saved.vars && typeof saved.vars === 'object') {
     for (const name of VAR_NAMES) {
@@ -6063,7 +6139,7 @@ function loadFullProject(project) {
       if (!data || typeof data !== 'object') continue;
       reserveInstanceId(kind, data.id);
       const inst = makeInstance(kind, instanceOptsFromSave(kind, data, saved));
-      if (data.csvLabel) inst.csvLabel = String(data.csvLabel);
+      if (data.csvLabel) inst.csvLabel = String(data.csvLabel).slice(0, 80);
       appendSecondaryCard(inst);
       renderInstanceName(inst);
     }
@@ -9272,9 +9348,16 @@ function _bumpBeyondCounter(kind) {
 
 function makeBeyondInst(kind, opts = {}) {
   const counter = _bumpBeyondCounter(kind);
-  const params = BEYOND_KIND_DEFAULTS[kind]();
-  // Apply optional overrides
-  if (opts.params) Object.assign(params, opts.params);
+  // Optional overrides (from a project file or shared link) are type-checked
+  // against the defaults; color and the volume center are handled apart.
+  const params = typedMerge(BEYOND_KIND_DEFAULTS[kind](), opts.params);
+  if (opts.params) {
+    params.color = safeHex(opts.params.color, '');
+    if ('center' in params) {
+      const c = Array.isArray(opts.params.center) ? opts.params.center : [];
+      params.center = [0, 1, 2].map(i => (Number.isFinite(+c[i]) ? +c[i] : 0));
+    }
+  }
   // Auto-name and color
   if (!params.name) {
     params.name = `${BEYOND_KIND_STEMS[kind]}${String(counter).padStart(2, '0')}`;
@@ -10147,13 +10230,213 @@ makeSidePanelDraggable('beyond_panel',  'beyond_panel_head',  'beyond_panel_coll
 wireFloatButton(PRIMARY_DED);
 wireFloatButton(PRIMARY_IND);
 
+// ============================================================================
+// Undo / redo
+// ============================================================================
+// Whole-scene snapshots (the same JSON as project save, minus panel
+// positions), captured 400 ms after the scene settles. Restoring goes
+// through loadFullProject(). Walk ticks aren't recorded one by one: while a
+// walk runs, capture waits until it stops.
+const HISTORY_LIMIT = 80;
+const undoHistory = { stack: [], index: -1, timer: null, restoring: false };
+
+function sceneSnapshot() {
+  const p = serializeFullProject();
+  delete p.panelPositions;
+  delete p.exportedAt;
+  return p;
+}
+// Snapshots that differ only in animation clocks are the same edit.
+function snapshotKey(p) {
+  return JSON.stringify(p, (k, v) => (k === 'local_t' || k === 't_cursor') ? undefined : v);
+}
+
+function syncHistoryButtons() {
+  const u = document.getElementById('btn_undo');
+  const r = document.getElementById('btn_redo');
+  if (u) u.disabled = undoHistory.index <= 0;
+  if (r) r.disabled = undoHistory.index >= undoHistory.stack.length - 1;
+}
+
+function captureHistory() {
+  clearTimeout(undoHistory.timer);
+  undoHistory.timer = null;
+  if (undoHistory.restoring) return;
+  if (anyWalking()) { scheduleHistory(); return; }
+  const snap = sceneSnapshot();
+  const key = snapshotKey(snap);
+  if (undoHistory.stack[undoHistory.index]?.key === key) return;
+  undoHistory.stack.length = undoHistory.index + 1;      // drop the redo branch
+  undoHistory.stack.push({ snap, key });
+  if (undoHistory.stack.length > HISTORY_LIMIT) undoHistory.stack.shift();
+  undoHistory.index = undoHistory.stack.length - 1;
+  syncHistoryButtons();
+}
+
+function scheduleHistory() {
+  if (undoHistory.restoring) return;
+  clearTimeout(undoHistory.timer);
+  undoHistory.timer = setTimeout(captureHistory, 400);
+}
+
+function restoreHistory(index) {
+  const entry = undoHistory.stack[index];
+  if (!entry) return;
+  undoHistory.restoring = true;
+  try {
+    loadFullProject(JSON.parse(JSON.stringify(entry.snap)));
+  } finally {
+    undoHistory.restoring = false;
+    clearTimeout(undoHistory.timer);
+    undoHistory.timer = null;
+  }
+  // A restored scene can serialize slightly differently from the snapshot
+  // (e.g. the legacy primary card becomes an ordinary card), so re-key the
+  // entry from what is actually on screen; otherwise the next capture would
+  // look like a new edit and wipe the redo branch.
+  entry.snap = sceneSnapshot();
+  entry.key = snapshotKey(entry.snap);
+  undoHistory.index = index;
+  syncHistoryButtons();
+}
+
+function undo() {
+  if (undoHistory.timer) captureHistory();   // record the edit in flight first
+  if (undoHistory.index > 0) restoreHistory(undoHistory.index - 1);
+}
+function redo() {
+  if (undoHistory.index < undoHistory.stack.length - 1) restoreHistory(undoHistory.index + 1);
+}
+
+{
+  const _regen = regenerate;
+  regenerate = function() { const r = _regen.apply(this, arguments); scheduleHistory(); return r; };
+  const _rebuildBeyond = rebuildBeyond;
+  rebuildBeyond = function() { const r = _rebuildBeyond.apply(this, arguments); scheduleHistory(); return r; };
+}
+
+document.getElementById('btn_undo').addEventListener('click', undo);
+document.getElementById('btn_redo').addEventListener('click', redo);
+window.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  // Leave text editing to the browser's own undo.
+  const t = e.target;
+  if (t && (t.isContentEditable || t.tagName === 'TEXTAREA' ||
+            (t.tagName === 'INPUT' && !['number', 'checkbox', 'color', 'range', 'button'].includes(t.type)))) return;
+  const k = e.key.toLowerCase();
+  if (k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+  else if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); redo(); }
+});
+
+// ============================================================================
+// Shareable links
+// ============================================================================
+// The scene snapshot is deflate-compressed and base64url-encoded into the
+// URL fragment (#scene=…). Fragments never reach a server, so sharing works
+// from GitHub Pages and from a local file alike.
+const SHARE_PREFIX = '#scene=';
+
+function bytesToBase64Url(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function base64UrlToBytes(str) {
+  const b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b64 + '==='.slice((b64.length + 3) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+async function encodeScene(obj) {
+  const stream = new Blob([JSON.stringify(obj)]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+  return bytesToBase64Url(new Uint8Array(await new Response(stream).arrayBuffer()));
+}
+async function decodeScene(str) {
+  const stream = new Blob([base64UrlToBytes(str)]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return JSON.parse(await new Response(stream).text());
+}
+
+function showSharePopover(url, copied) {
+  document.querySelector('.share-pop')?.remove();
+  const pop = document.createElement('div');
+  pop.className = 'share-pop';
+  const msg = document.createElement('div');
+  msg.textContent = copied
+    ? 'Link copied. Anyone who opens it sees this scene.'
+    : 'Copy this link. Anyone who opens it sees this scene.';
+  const row = document.createElement('div');
+  row.className = 'row';
+  const input = document.createElement('input');
+  input.readOnly = true;
+  input.value = url;
+  input.id = 'share_url';
+  const close = document.createElement('button');
+  close.textContent = 'Close';
+  close.addEventListener('click', () => pop.remove());
+  row.append(input, close);
+  pop.append(msg, row);
+  document.body.appendChild(pop);
+  input.focus();
+  input.select();
+}
+
+async function shareScene() {
+  const url = location.href.split('#')[0] + SHARE_PREFIX + await encodeScene(sceneSnapshot());
+  let copied = false;
+  try { await navigator.clipboard.writeText(url); copied = true; } catch (_) {}
+  showSharePopover(url, copied);
+}
+document.getElementById('btn_share').addEventListener('click', () => {
+  shareScene().catch(err => alert('Could not create a link: ' + err.message));
+});
+
+function toast(text) {
+  const note = document.createElement('div');
+  note.textContent = text;
+  note.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#1a1a2e;color:#aaa;padding:6px 12px;border:1px solid #333;border-radius:3px;font-size:12px;z-index:99999';
+  document.body.appendChild(note);
+  setTimeout(() => note.remove(), 1800);
+}
+
+// Load the scene in the URL fragment, if any. Returns a promise of whether
+// a scene was loaded. The fragment is removed afterwards so later edits
+// and reloads don't snap back to the shared scene.
+async function loadSceneFromHash() {
+  if (!location.hash.startsWith(SHARE_PREFIX)) return false;
+  const encoded = location.hash.slice(SHARE_PREFIX.length);
+  history.replaceState(null, '', location.pathname + location.search);
+  try {
+    const project = await decodeScene(encoded);
+    if (!loadFullProject(project)) return false;
+    toast('Shared scene loaded');
+    return true;
+  } catch (err) {
+    alert('This link\'s scene could not be read. It may have been cut off when it was copied.');
+    return false;
+  }
+}
+window.addEventListener('hashchange', () => {
+  if (location.hash.startsWith(SHARE_PREFIX)) {
+    loadSceneFromHash().then(ok => { if (ok) captureHistory(); });
+  }
+});
+
 new ResizeObserver(resize).observe(canvas);
 resize();
 regenerate();
 animate();
 
-// Opt-in autosave: if the user turned autosave on, reopen their last session.
-tryRestoreAutosave();
+// Startup scene: a shared link wins; otherwise, if the user turned autosave
+// on, reopen their last session. Then record the starting point for undo.
+if (location.hash.startsWith(SHARE_PREFIX)) {
+  loadSceneFromHash().then(() => captureHistory());
+} else {
+  tryRestoreAutosave();
+  captureHistory();
+}
 
 // v9 welcome: if nothing was auto-restored and we have almost no instances,
 // seed a small complex chaotic scene.

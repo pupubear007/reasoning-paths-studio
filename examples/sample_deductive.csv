@@ -1,0 +1,4 @@
+id,start_x,start_y,start_z,x_inc,y_inc,z_inc,steps,ded_polarity
+A,0,0,0,0.05,0.02,0.01,20,up
+B,0,2,0,-0.03,0.04,0.02,20,up
+C,0,0,-1,0.01,-0.05,0.03,20,down

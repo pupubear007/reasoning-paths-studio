@@ -2029,6 +2029,16 @@ const state = {
 
 const VAR_NAMES = ['l','m','n','p','q','r','c','d'];
 
+// Upper bounds on point counts. Each deductive step / inductive iteration
+// becomes a drawn point, and Chaotic iterations size buffers that are
+// refilled every frame; without caps a typo like 1e7 freezes the tab.
+const MAX_PATH_POINTS = 5000;
+const MAX_CHAOS_ITERS = 200000;
+function clampCount(v, max) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.min(max, Math.max(1, n)) : 1;
+}
+
 // ---------- Expression engine ----------
 // Tiny recursive-descent parser for arithmetic expressions over the user
 // variables l, m, n, p, q, r, c, d plus a small library of functions and
@@ -2545,7 +2555,7 @@ function deductivePath(inst) {
   const dy = sign * getParam(I,'y_inc');
   const dz = sign * getParam(I,'z_inc');
   pts.push([x,y,z]);
-  const steps = getParam(I,'steps');
+  const steps = clampCount(getParam(I,'steps'), MAX_PATH_POINTS);
   for (let i = 0; i < steps; i++) {
     x += dx; y += dy; z += dz;
     pts.push([x,y,z]);
@@ -2563,7 +2573,7 @@ function inductivePath(inst) {
   const ts = getParam(I,'ind_polarity') === 'positive' ? tInc : -tInc;
   const ps = getParam(I,'ind_polarity') === 'positive' ? pInc : -pInc;
   const sigma = getParam(I,'sigma');
-  const iters = getParam(I,'iterations');
+  const iters = clampCount(getParam(I,'iterations'), MAX_PATH_POINTS);
   const sph = [[r,th,ph]];
   for (let i = 0; i < iters; i++) {
     r += gauss() * sigma / (i+1);
@@ -2672,7 +2682,7 @@ const CHAOTIC_PRESETS = {
 function buildChaoticLive(inst) {
   clearGroup(inst.pathGroup);
 
-  const iters = Math.max(1, Math.round(getParam(inst, 'iterations')));
+  const iters = clampCount(getParam(inst, 'iterations'), MAX_CHAOS_ITERS);
   const mRaw  = String(getParam(inst, 'm_values') ?? '0');
   const mVals = mRaw.split(',').map(s => parseFloat(s.trim())).filter(v => Number.isFinite(v));
   const mList = mVals.length ? mVals : [0];
@@ -2737,16 +2747,41 @@ function buildChaoticLive(inst) {
     });
     mat.resolution.set(canvas.clientWidth, canvas.clientHeight);
     line = new Line2(geo, mat);
-    line.computeLineDistances();
+    // Positions are rewritten in place every frame (updateChaoticLive), so
+    // the bounding sphere computed here goes stale; don't cull on it.
+    line.frustumCulled = false;
     inst.pathGroup.add(line);
   }
+  points.frustumCulled = false;
 
   inst.live = {
     iters, mList, total,
     positions3,
     ptsGeo, points, line,
     compiledFn, compileError,
+    lastT: +getParam(inst, 'local_t') || 0,   // t the buffers currently hold
+    sig: chaoticSignature(inst),
   };
+}
+
+// Everything buildChaoticLive() depends on except local_t (which the
+// per-frame update handles). regenerate() rebuilds a Chaotic instance only
+// when this changes, so walks, variable edits and other instances' edits
+// no longer recompile and reallocate every cloud on each tick.
+function chaoticSignature(inst) {
+  return JSON.stringify([
+    chaosDefs(inst.params),
+    getParam(inst, 'x_expr'), getParam(inst, 'y_expr'), getParam(inst, 'z_expr'),
+    getParam(inst, 'iterations'), getParam(inst, 'm_values'),
+    !!getParam(inst, 'show_line'), !!getParam(inst, 'show_points'),
+    inst.color,
+  ]);
+}
+
+function ensureChaoticLive(inst) {
+  if (!inst.live || inst.live.sig !== chaoticSignature(inst) || inst.pathGroup.children.length === 0) {
+    buildChaoticLive(inst);
+  }
 }
 
 // Inner hot loop: write iters × mList.length × 3 floats into `positions3`.
@@ -2775,11 +2810,24 @@ function fillChaoticPositions(positions3, compiledFn, iters, mList, t) {
 function updateChaoticLive(inst, tNow) {
   if (!inst.live || !inst.live.compiledFn) return;
   const live = inst.live;
+  // Paused clouds keep the same t, so their buffers are already current.
+  if (tNow === live.lastT) return;
+  live.lastT = tNow;
   fillChaoticPositions(live.positions3, live.compiledFn, live.iters, live.mList, tNow);
   live.ptsGeo.attributes.position.needsUpdate = true;
   if (live.line) {
-    live.line.geometry.setPositions(Array.from(live.positions3));
-    live.line.computeLineDistances();
+    // LineGeometry stores segments as interleaved [start, end] pairs.
+    // Rewrite that buffer in place instead of setPositions(), which
+    // allocates new GPU buffers every frame (and never frees the old ones).
+    const buf = live.line.geometry.attributes.instanceStart.data;
+    const seg = buf.array, P = live.positions3;
+    const n = Math.min(live.total - 1, seg.length / 6);
+    for (let k = 0; k < n; k++) {
+      const s3 = k * 3, d = k * 6;
+      seg[d]     = P[s3];     seg[d + 1] = P[s3 + 1]; seg[d + 2] = P[s3 + 2];
+      seg[d + 3] = P[s3 + 3]; seg[d + 4] = P[s3 + 4]; seg[d + 5] = P[s3 + 5];
+    }
+    buf.needsUpdate = true;
   }
 }
 
@@ -2788,7 +2836,7 @@ function updateChaoticLive(inst, tNow) {
 // expressions are short enough to read raw, and any reformatting would be a
 // liability ("why does the panel show k_expr different from what I typed?").
 function chaoticEquationLines(inst) {
-  const iters = Math.max(1, Math.round(getParam(inst, 'iterations')));
+  const iters = clampCount(getParam(inst, 'iterations'), MAX_CHAOS_ITERS);
   const mRaw  = String(getParam(inst, 'm_values') ?? '0');
   const speed = +getParam(inst, 'param_t_speed') || 1;
   const defs = chaosDefs(inst.params);
@@ -2991,6 +3039,7 @@ scene.add(dedGroup); scene.add(indGroup); scene.add(tracksRoot);
 function clearGroup(g) {
   while (g.children.length) {
     const c = g.children.pop();
+    if (c.isInstancedMesh) c.dispose();     // frees the per-instance buffers
     if (c.geometry) c.geometry.dispose();
     if (c.material) {
       if (Array.isArray(c.material)) c.material.forEach(m=>m.dispose());
@@ -3315,15 +3364,25 @@ function buildPath(group, pts, color, opts={}) {
   line.computeLineDistances();
   group.add(line);
 
-  // markers
-  const sphereGeo = new THREE.SphereGeometry(0.035, 14, 14);
+  // markers — one instanced mesh (a draw call and a geometry per path,
+  // not per point), tinted along the same gradient as the line.
+  const markers = new THREE.InstancedMesh(
+    new THREE.SphereGeometry(0.035, 14, 14),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }),
+    pts.length
+  );
+  const mtx = new THREE.Matrix4();
+  const mc = new THREE.Color();
   for (let i = 0; i < pts.length; i++) {
     const t = pts.length > 1 ? i/(pts.length-1) : 1;
-    const c = c0.clone().lerp(c1, t);
-    const m = new THREE.Mesh(sphereGeo.clone(), new THREE.MeshBasicMaterial({ color: c }));
-    m.position.set(pts[i][0], pts[i][2], -pts[i][1]);
-    group.add(m);
+    mtx.makeTranslation(pts[i][0], pts[i][2], -pts[i][1]);
+    markers.setMatrixAt(i, mtx);
+    markers.setColorAt(i, mc.copy(c0).lerp(c1, t));
   }
+  markers.instanceMatrix.needsUpdate = true;
+  markers.instanceColor.needsUpdate = true;
+  markers.computeBoundingSphere();
+  group.add(markers);
 
   // start = ring, end = filled larger dot
   const ring = new THREE.Mesh(
@@ -3633,7 +3692,7 @@ function regenerate() {
       // Parametric instances use a live geometry: positions are allocated once
       // and updated in place by updateChaoticLive each frame. We rebuild
       // here on parameter change so iterations/m_values reshape the buffer.
-      buildChaoticLive(inst);
+      ensureChaoticLive(inst);
       // Return the notebook-coord scratch buffer reshaped as a pts array so
       // downstream code (track snapshots, projection minis) sees something
       // non-null. We don't actually feed parametric points into projection
@@ -3648,7 +3707,7 @@ function regenerate() {
   });
   // Chaotic instances (kind='chaos') are always parametric
   chaosRenders = chaosInstances.map(inst => {
-    buildChaoticLive(inst);
+    ensureChaoticLive(inst);
     return { inst, pts: [] };
   });
   ded = dedRenders[0]?.pts || [];
@@ -3859,7 +3918,7 @@ const VAR_LABELS = { l: 'l', m: 'm', n: 'n', p: 'p', q: 'q', r: 'r', c: 'c', d: 
 
 // Quantize an expression result for fields that should be integers.
 function quantize(id, v) {
-  if (INT_FIELDS.has(id)) return Math.max(1, Math.round(v));
+  if (INT_FIELDS.has(id)) return clampCount(v, MAX_PATH_POINTS);
   return v;
 }
 
@@ -4415,7 +4474,7 @@ function bindSlider(id, fmt) {
   const val = document.getElementById(id + '_val');
   const isInt = el.step && parseFloat(el.step) >= 1;
   const update = () => {
-    state[id] = isInt ? parseInt(el.value) : parseFloat(el.value);
+    state[id] = isInt ? clampCount(el.value, MAX_PATH_POINTS) : parseFloat(el.value);
     val.textContent = fmt ? fmt(state[id]) : (isInt ? state[id] : state[id].toFixed(el.step.includes('.') ? el.step.split('.')[1].length : 2));
     regenerate();
   };
@@ -4900,7 +4959,7 @@ function wireParametricCard(inst) {
       } else {
         let v = parseFloat(raw);
         if (!Number.isFinite(v)) v = 0;
-        if (intOnly) v = Math.max(1, Math.round(v));
+        if (intOnly) v = clampCount(v, MAX_CHAOS_ITERS);
         inst.params[key] = v;
         if (valEl) valEl.textContent = intOnly ? String(v) : v.toFixed(dec);
       }
@@ -5271,7 +5330,7 @@ function wireSecondaryCard(inst) {
     el.addEventListener('input', () => {
       let v = parseFloat(el.value);
       if (!Number.isFinite(v)) v = 0;
-      if (f.int) v = Math.max(1, Math.round(v));
+      if (f.int) v = clampCount(v, MAX_PATH_POINTS);
       inst.params[f.key] = v;
       if (valEl) valEl.textContent = f.int ? String(v) : v.toFixed(f.dec);
       regenerate();
@@ -5547,7 +5606,7 @@ function csvRowToParams(kind, header, row, lineNo) {
       if (raw === undefined || raw === '') continue;   // tolerate older partial files
       const v = Number(raw);
       if (!Number.isFinite(v)) throw new Error(`Line ${lineNo}: "${k}"="${raw}" is not a number`);
-      params[k] = INT_CSV_KEYS.has(k) ? Math.max(1, Math.round(v)) : v;
+      params[k] = INT_CSV_KEYS.has(k) ? clampCount(v, MAX_CHAOS_ITERS) : v;
     }
     const mv = get('m_values'); if (mv !== undefined && mv !== '') params.m_values = mv;
     const pr = get('preset');   if (pr !== undefined) params.preset = pr;
@@ -5576,7 +5635,7 @@ function csvRowToParams(kind, header, row, lineNo) {
     } else {
       const v = Number(raw);
       if (!Number.isFinite(v)) throw new Error(`Line ${lineNo}: "${k}"="${raw}" is not a number`);
-      params[k] = INT_CSV_KEYS.has(k) ? Math.max(1, Math.round(v)) : v;
+      params[k] = INT_CSV_KEYS.has(k) ? clampCount(v, MAX_PATH_POINTS) : v;
     }
   }
   const idCol = colIdx['id'];
@@ -7439,7 +7498,7 @@ function tickInstance(inst) {
         const off = cur - inst.anchor[p];
         next = inst.anchor[p] + off * (1 - pull) + walkNoise() * stepMag;
       }
-      if (INT_PARAMS.has(p)) next = Math.max(1, Math.round(next));
+      if (INT_PARAMS.has(p)) next = clampCount(next, MAX_PATH_POINTS);
       writeParam(p, next);
       syncParamUI(p);
     });

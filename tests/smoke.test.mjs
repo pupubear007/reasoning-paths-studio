@@ -161,3 +161,29 @@ test('autosave restores the session after a reload', async () => {
   await click('#autosave_status');                         // leave it off
   assert.deepEqual(errors, []);
 });
+
+// ---------- Limits & live Chaotic updates ----------
+
+test('huge Steps / Iterations values are capped instead of freezing the page', async () => {
+  await click('#btn_ded_add');
+  const sx = await page.$eval('#ded_instances_host .inst-card:last-child', c => 'd' + c.dataset.instId);
+  await page.$eval(`#steps__${sx}`, el => { el.value = '10000000'; el.dispatchEvent(new Event('input')); });
+  assert.equal(await page.textContent(`#steps_val__${sx}`), '5000');
+  await click('#btn_chaos_add');
+  const cx = await page.$eval('.inst-card.chaos:last-of-type', c => 'x' + c.dataset.instId);
+  await page.$eval(`#iterations__${cx}`, el => { el.value = '1e9'; el.dispatchEvent(new Event('input')); });
+  assert.equal(await page.textContent(`#iterations_val__${cx}`), '200000');
+  assert.deepEqual(errors, []);
+});
+
+test('animating a Chaotic cloud with the line overlay updates in place', async () => {
+  const cx = await page.$eval('.inst-card.chaos:last-of-type', c => 'x' + c.dataset.instId);
+  await page.$eval(`#iterations__${cx}`, el => { el.value = '2000'; el.dispatchEvent(new Event('input')); });
+  await click(`[data-param-btn="show_line"][data-param-val="on"][data-suffix="${cx}"]`);
+  await click(`[data-chaotic-play="${cx}"]`);
+  const t0 = Number(await page.inputValue(`#local_t__${cx}`));
+  await page.waitForFunction(([id, t]) => Number(document.getElementById(id).value) > t,
+                             [`local_t__${cx}`, t0]);
+  await click(`[data-chaotic-play="${cx}"]`);
+  assert.deepEqual(errors, []);
+});

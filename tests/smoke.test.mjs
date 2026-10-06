@@ -33,7 +33,8 @@ before(async () => {
   await page.route('https://fonts.googleapis.com/**', (r) => r.abort());
   await page.route('https://fonts.gstatic.com/**', (r) => r.abort());
   await page.goto(pageUrl);
-  await page.waitForFunction(() => document.getElementById('st_seed')?.textContent === '0x42a1');
+  await page.waitForFunction(() => document.getElementById('st_seed')?.textContent === '0x42a1',
+                             null, { polling: 100 });
 });
 
 after(async () => { await browser?.close(); });
@@ -103,10 +104,13 @@ async function saveProject() {
   return readFileSync(await download.path(), 'utf8');
 }
 async function loadProject(file) {
+  const loads = await page.evaluate(() => +document.body.dataset.projectLoads || 0);
   const [chooser] = await Promise.all([page.waitForEvent('filechooser'), click('#btn_project_load')]);
   await chooser.setFiles(file);
-  await page.waitForFunction(() => [...document.querySelectorAll('div')]
-    .some(d => d.textContent === 'Project loaded ✓'));
+  // Poll on a timer, not on animation frames: software-rendered frames can
+  // be several hundred ms apart on CI runners.
+  await page.waitForFunction(n => (+document.body.dataset.projectLoads || 0) > n, loads,
+                             { polling: 100, timeout: 60000 });
 }
 
 test('loading a project replaces the scene instead of duplicating it', async () => {
@@ -155,7 +159,8 @@ test('autosave restores the session after a reload', async () => {
   await page.waitForTimeout(1200);                         // autosave debounce
   const before = await countCards();
   await page.reload();
-  await page.waitForFunction(() => document.getElementById('st_seed')?.textContent);
+  await page.waitForFunction(() => document.getElementById('st_seed')?.textContent,
+                             null, { polling: 100 });
   assert.equal(await page.textContent('#autosave_status'), 'restored');
   assert.deepEqual(await countCards(), before);
   await click('#autosave_status');                         // leave it off
@@ -183,7 +188,7 @@ test('animating a Chaotic cloud with the line overlay updates in place', async (
   await click(`[data-chaotic-play="${cx}"]`);
   const t0 = Number(await page.inputValue(`#local_t__${cx}`));
   await page.waitForFunction(([id, t]) => Number(document.getElementById(id).value) > t,
-                             [`local_t__${cx}`, t0]);
+                             [`local_t__${cx}`, t0], { polling: 100 });
   await click(`[data-chaotic-play="${cx}"]`);
   assert.deepEqual(errors, []);
 });

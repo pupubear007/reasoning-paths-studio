@@ -11,7 +11,9 @@ It is built on [three.js](https://threejs.org/) r160 and ships as one self-conta
 
 ## Running it
 
-Open `index.html` in a recent desktop browser (Chrome, Edge, Firefox or Safari). There is no build step.
+**Online:** https://pupubear007.github.io/reasoning-paths-studio/ (published from `main` by GitHub Actions).
+
+**Locally:** open `index.html` in a recent desktop browser (Chrome, Edge, Firefox or Safari). There is no build step.
 
 - Volume clouds need WebGL2.
 - three.js and the web fonts load from CDNs (`unpkg.com`, `fonts.googleapis.com`), so the first load needs internet access.
@@ -26,13 +28,17 @@ Open `index.html` in a recent desktop browser (Chrome, Edge, Firefox or Safari).
 | **Walk** panel | Random walks over any set of parameters or variables, run all at once or in turn. Turn on a card's *Movement track* to keep ghost trails of past frames. |
 | **Equations** panel | A read-only symbolic readout of every instance, with ƒx expressions and their resolved values. |
 | **Beyond paths** panel | Curves, surfaces, vector fields and volumes. All accept the same expression syntax, including the shared variables. |
-| Toolbar | Reseed, grid/axes/shadow toggles, zoom, auto-orbit, PNG export, project save/load (JSON), **✧ Surprise me**, clear canvas, and an opt-in autosave. |
+| Toolbar | Reseed, grid/axes/shadow toggles, zoom, auto-orbit, PNG export, project save/load (JSON), **✧ Surprise me**, and clear canvas. Click the *autosave* label to turn on autosave: the session is then saved to this browser and reopened the next time you load the page. |
 
 ### Expression syntax
 
 `+ - * / ^` (or `**`), parentheses, and these functions:
 `sin cos tan asin acos atan sec csc cot asec acsc acot sinh cosh tanh asinh acosh atanh sech csch coth asech acsch acoth sqrt abs exp ln log sgn hypot(a,b) mag(a,b) atan2(y,x)`.
 The constants are `e`, `pi` and `π`. Expressions go through a small whitelist parser, so user text is never passed to `eval`.
+
+### Limits
+
+Deductive steps and inductive iterations are capped at 5,000 points per path, and Chaotic iterations at 200,000. Larger values, whether typed, computed by an ƒx expression, walked or imported, are clamped.
 
 ### CSV format
 
@@ -55,7 +61,9 @@ npm install          # installs three@0.160.0 and Playwright (for tests only)
 npm test             # expression-engine unit tests + headless browser smoke test
 ```
 
-The smoke test opens `index.html` in headless Chromium and serves three.js from `node_modules`, so it works without CDN access. Set `CHROMIUM_PATH` if Playwright can't find a browser.
+The smoke test opens `index.html` in headless Chromium and serves three.js from `node_modules`, so it works without CDN access. Run `npx playwright-core install chromium` once to download the browser, or set `CHROMIUM_PATH` to point at an existing Chrome or Chromium.
+
+GitHub Actions runs the tests on every push and pull request (`.github/workflows/test.yml`) and deploys `main` to GitHub Pages (`.github/workflows/pages.yml`).
 
 ## License
 

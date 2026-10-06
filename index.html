@@ -2029,6 +2029,16 @@ const state = {
 
 const VAR_NAMES = ['l','m','n','p','q','r','c','d'];
 
+// Upper bounds on point counts. Each deductive step / inductive iteration
+// becomes a drawn point, and Chaotic iterations size buffers that are
+// refilled every frame; without caps a typo like 1e7 freezes the tab.
+const MAX_PATH_POINTS = 5000;
+const MAX_CHAOS_ITERS = 200000;
+function clampCount(v, max) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.min(max, Math.max(1, n)) : 1;
+}
+
 // ---------- Expression engine ----------
 // Tiny recursive-descent parser for arithmetic expressions over the user
 // variables l, m, n, p, q, r, c, d plus a small library of functions and
@@ -2545,7 +2555,7 @@ function deductivePath(inst) {
   const dy = sign * getParam(I,'y_inc');
   const dz = sign * getParam(I,'z_inc');
   pts.push([x,y,z]);
-  const steps = getParam(I,'steps');
+  const steps = clampCount(getParam(I,'steps'), MAX_PATH_POINTS);
   for (let i = 0; i < steps; i++) {
     x += dx; y += dy; z += dz;
     pts.push([x,y,z]);
@@ -2563,7 +2573,7 @@ function inductivePath(inst) {
   const ts = getParam(I,'ind_polarity') === 'positive' ? tInc : -tInc;
   const ps = getParam(I,'ind_polarity') === 'positive' ? pInc : -pInc;
   const sigma = getParam(I,'sigma');
-  const iters = getParam(I,'iterations');
+  const iters = clampCount(getParam(I,'iterations'), MAX_PATH_POINTS);
   const sph = [[r,th,ph]];
   for (let i = 0; i < iters; i++) {
     r += gauss() * sigma / (i+1);
@@ -2672,7 +2682,7 @@ const CHAOTIC_PRESETS = {
 function buildChaoticLive(inst) {
   clearGroup(inst.pathGroup);
 
-  const iters = Math.max(1, Math.round(getParam(inst, 'iterations')));
+  const iters = clampCount(getParam(inst, 'iterations'), MAX_CHAOS_ITERS);
   const mRaw  = String(getParam(inst, 'm_values') ?? '0');
   const mVals = mRaw.split(',').map(s => parseFloat(s.trim())).filter(v => Number.isFinite(v));
   const mList = mVals.length ? mVals : [0];
@@ -2737,16 +2747,41 @@ function buildChaoticLive(inst) {
     });
     mat.resolution.set(canvas.clientWidth, canvas.clientHeight);
     line = new Line2(geo, mat);
-    line.computeLineDistances();
+    // Positions are rewritten in place every frame (updateChaoticLive), so
+    // the bounding sphere computed here goes stale; don't cull on it.
+    line.frustumCulled = false;
     inst.pathGroup.add(line);
   }
+  points.frustumCulled = false;
 
   inst.live = {
     iters, mList, total,
     positions3,
     ptsGeo, points, line,
     compiledFn, compileError,
+    lastT: +getParam(inst, 'local_t') || 0,   // t the buffers currently hold
+    sig: chaoticSignature(inst),
   };
+}
+
+// Everything buildChaoticLive() depends on except local_t (which the
+// per-frame update handles). regenerate() rebuilds a Chaotic instance only
+// when this changes, so walks, variable edits and other instances' edits
+// no longer recompile and reallocate every cloud on each tick.
+function chaoticSignature(inst) {
+  return JSON.stringify([
+    chaosDefs(inst.params),
+    getParam(inst, 'x_expr'), getParam(inst, 'y_expr'), getParam(inst, 'z_expr'),
+    getParam(inst, 'iterations'), getParam(inst, 'm_values'),
+    !!getParam(inst, 'show_line'), !!getParam(inst, 'show_points'),
+    inst.color,
+  ]);
+}
+
+function ensureChaoticLive(inst) {
+  if (!inst.live || inst.live.sig !== chaoticSignature(inst) || inst.pathGroup.children.length === 0) {
+    buildChaoticLive(inst);
+  }
 }
 
 // Inner hot loop: write iters × mList.length × 3 floats into `positions3`.
@@ -2775,11 +2810,24 @@ function fillChaoticPositions(positions3, compiledFn, iters, mList, t) {
 function updateChaoticLive(inst, tNow) {
   if (!inst.live || !inst.live.compiledFn) return;
   const live = inst.live;
+  // Paused clouds keep the same t, so their buffers are already current.
+  if (tNow === live.lastT) return;
+  live.lastT = tNow;
   fillChaoticPositions(live.positions3, live.compiledFn, live.iters, live.mList, tNow);
   live.ptsGeo.attributes.position.needsUpdate = true;
   if (live.line) {
-    live.line.geometry.setPositions(Array.from(live.positions3));
-    live.line.computeLineDistances();
+    // LineGeometry stores segments as interleaved [start, end] pairs.
+    // Rewrite that buffer in place instead of setPositions(), which
+    // allocates new GPU buffers every frame (and never frees the old ones).
+    const buf = live.line.geometry.attributes.instanceStart.data;
+    const seg = buf.array, P = live.positions3;
+    const n = Math.min(live.total - 1, seg.length / 6);
+    for (let k = 0; k < n; k++) {
+      const s3 = k * 3, d = k * 6;
+      seg[d]     = P[s3];     seg[d + 1] = P[s3 + 1]; seg[d + 2] = P[s3 + 2];
+      seg[d + 3] = P[s3 + 3]; seg[d + 4] = P[s3 + 4]; seg[d + 5] = P[s3 + 5];
+    }
+    buf.needsUpdate = true;
   }
 }
 
@@ -2788,7 +2836,7 @@ function updateChaoticLive(inst, tNow) {
 // expressions are short enough to read raw, and any reformatting would be a
 // liability ("why does the panel show k_expr different from what I typed?").
 function chaoticEquationLines(inst) {
-  const iters = Math.max(1, Math.round(getParam(inst, 'iterations')));
+  const iters = clampCount(getParam(inst, 'iterations'), MAX_CHAOS_ITERS);
   const mRaw  = String(getParam(inst, 'm_values') ?? '0');
   const speed = +getParam(inst, 'param_t_speed') || 1;
   const defs = chaosDefs(inst.params);
@@ -2991,6 +3039,7 @@ scene.add(dedGroup); scene.add(indGroup); scene.add(tracksRoot);
 function clearGroup(g) {
   while (g.children.length) {
     const c = g.children.pop();
+    if (c.isInstancedMesh) c.dispose();     // frees the per-instance buffers
     if (c.geometry) c.geometry.dispose();
     if (c.material) {
       if (Array.isArray(c.material)) c.material.forEach(m=>m.dispose());
@@ -3315,15 +3364,25 @@ function buildPath(group, pts, color, opts={}) {
   line.computeLineDistances();
   group.add(line);
 
-  // markers
-  const sphereGeo = new THREE.SphereGeometry(0.035, 14, 14);
+  // markers — one instanced mesh (a draw call and a geometry per path,
+  // not per point), tinted along the same gradient as the line.
+  const markers = new THREE.InstancedMesh(
+    new THREE.SphereGeometry(0.035, 14, 14),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }),
+    pts.length
+  );
+  const mtx = new THREE.Matrix4();
+  const mc = new THREE.Color();
   for (let i = 0; i < pts.length; i++) {
     const t = pts.length > 1 ? i/(pts.length-1) : 1;
-    const c = c0.clone().lerp(c1, t);
-    const m = new THREE.Mesh(sphereGeo.clone(), new THREE.MeshBasicMaterial({ color: c }));
-    m.position.set(pts[i][0], pts[i][2], -pts[i][1]);
-    group.add(m);
+    mtx.makeTranslation(pts[i][0], pts[i][2], -pts[i][1]);
+    markers.setMatrixAt(i, mtx);
+    markers.setColorAt(i, mc.copy(c0).lerp(c1, t));
   }
+  markers.instanceMatrix.needsUpdate = true;
+  markers.instanceColor.needsUpdate = true;
+  markers.computeBoundingSphere();
+  group.add(markers);
 
   // start = ring, end = filled larger dot
   const ring = new THREE.Mesh(
@@ -3633,7 +3692,7 @@ function regenerate() {
       // Parametric instances use a live geometry: positions are allocated once
       // and updated in place by updateChaoticLive each frame. We rebuild
       // here on parameter change so iterations/m_values reshape the buffer.
-      buildChaoticLive(inst);
+      ensureChaoticLive(inst);
       // Return the notebook-coord scratch buffer reshaped as a pts array so
       // downstream code (track snapshots, projection minis) sees something
       // non-null. We don't actually feed parametric points into projection
@@ -3648,7 +3707,7 @@ function regenerate() {
   });
   // Chaotic instances (kind='chaos') are always parametric
   chaosRenders = chaosInstances.map(inst => {
-    buildChaoticLive(inst);
+    ensureChaoticLive(inst);
     return { inst, pts: [] };
   });
   ded = dedRenders[0]?.pts || [];
@@ -3859,7 +3918,7 @@ const VAR_LABELS = { l: 'l', m: 'm', n: 'n', p: 'p', q: 'q', r: 'r', c: 'c', d: 
 
 // Quantize an expression result for fields that should be integers.
 function quantize(id, v) {
-  if (INT_FIELDS.has(id)) return Math.max(1, Math.round(v));
+  if (INT_FIELDS.has(id)) return clampCount(v, MAX_PATH_POINTS);
   return v;
 }
 
@@ -4415,7 +4474,7 @@ function bindSlider(id, fmt) {
   const val = document.getElementById(id + '_val');
   const isInt = el.step && parseFloat(el.step) >= 1;
   const update = () => {
-    state[id] = isInt ? parseInt(el.value) : parseFloat(el.value);
+    state[id] = isInt ? clampCount(el.value, MAX_PATH_POINTS) : parseFloat(el.value);
     val.textContent = fmt ? fmt(state[id]) : (isInt ? state[id] : state[id].toFixed(el.step.includes('.') ? el.step.split('.')[1].length : 2));
     regenerate();
   };
@@ -4900,7 +4959,7 @@ function wireParametricCard(inst) {
       } else {
         let v = parseFloat(raw);
         if (!Number.isFinite(v)) v = 0;
-        if (intOnly) v = Math.max(1, Math.round(v));
+        if (intOnly) v = clampCount(v, MAX_CHAOS_ITERS);
         inst.params[key] = v;
         if (valEl) valEl.textContent = intOnly ? String(v) : v.toFixed(dec);
       }
@@ -5271,7 +5330,7 @@ function wireSecondaryCard(inst) {
     el.addEventListener('input', () => {
       let v = parseFloat(el.value);
       if (!Number.isFinite(v)) v = 0;
-      if (f.int) v = Math.max(1, Math.round(v));
+      if (f.int) v = clampCount(v, MAX_PATH_POINTS);
       inst.params[f.key] = v;
       if (valEl) valEl.textContent = f.int ? String(v) : v.toFixed(f.dec);
       regenerate();
@@ -5547,7 +5606,7 @@ function csvRowToParams(kind, header, row, lineNo) {
       if (raw === undefined || raw === '') continue;   // tolerate older partial files
       const v = Number(raw);
       if (!Number.isFinite(v)) throw new Error(`Line ${lineNo}: "${k}"="${raw}" is not a number`);
-      params[k] = INT_CSV_KEYS.has(k) ? Math.max(1, Math.round(v)) : v;
+      params[k] = INT_CSV_KEYS.has(k) ? clampCount(v, MAX_CHAOS_ITERS) : v;
     }
     const mv = get('m_values'); if (mv !== undefined && mv !== '') params.m_values = mv;
     const pr = get('preset');   if (pr !== undefined) params.preset = pr;
@@ -5576,7 +5635,7 @@ function csvRowToParams(kind, header, row, lineNo) {
     } else {
       const v = Number(raw);
       if (!Number.isFinite(v)) throw new Error(`Line ${lineNo}: "${k}"="${raw}" is not a number`);
-      params[k] = INT_CSV_KEYS.has(k) ? Math.max(1, Math.round(v)) : v;
+      params[k] = INT_CSV_KEYS.has(k) ? clampCount(v, MAX_PATH_POINTS) : v;
     }
   }
   const idCol = colIdx['id'];
@@ -5823,10 +5882,10 @@ updateInstanceCounts();
 function serializeFullProject() {
   const project = {
     format: 'reasoning-paths-project',
-    version: 7,
+    version: 8,
     exportedAt: new Date().toISOString(),
     meta: {
-      title: 'Reasoning Paths v8',
+      title: 'Reasoning Paths v9',
     },
     // Core app state (sliders + global vars + expressions)
     state: {
@@ -5910,95 +5969,121 @@ function capturePanelPositions() {
   return out;
 }
 
+// Keys of `state` that a project file may restore. Everything else in a
+// saved `state` (expressions of the old primary card, vestigial fields) is
+// handled explicitly or ignored, so a crafted file can't plant arbitrary keys.
+const RESTORABLE_STATE_KEYS = [
+  ...DED_PARAM_KEYS, ...IND_PARAM_KEYS,
+  'seed', 'showGrid', 'showAxes', 'showShadow', 'animate', 'axisLen',
+];
+
+// Raise a kind's id counter so the next makeInstance() yields `id`. Keeps
+// saved ids stable across save/load, which matters because volume clouds
+// reference paths by id ('ded-3').
+function reserveInstanceId(kind, id) {
+  if (!Number.isInteger(id) || id < 1) return;
+  if (kind === 'ded') dedInstanceCounter = Math.max(dedInstanceCounter, id - 1);
+  else if (kind === 'chaos') chaosInstanceCounter = Math.max(chaosInstanceCounter, id - 1);
+  else indInstanceCounter = Math.max(indInstanceCounter, id - 1);
+}
+
+// Turn one serialized instance into makeInstance() options. Projects saved
+// by v8/v9 store the original "primary" card with params: null (its values
+// lived in the top-level state); those are rebuilt from project.state so
+// every loaded instance is an ordinary, self-contained card.
+function instanceOptsFromSave(kind, data, savedState) {
+  let params = data.params;
+  let expressions = data.expressions || {};
+  if (data.isPrimary || !params) {
+    const keys = kind === 'ded' ? DED_PARAM_KEYS : IND_PARAM_KEYS;
+    params = {};
+    for (const k of keys) if (savedState && k in savedState) params[k] = savedState[k];
+    const prim = (savedState && savedState.expressions) || {};
+    expressions = Object.fromEntries(Object.entries(prim).filter(([k]) => keys.includes(k)));
+  }
+  const defaults = kind === 'ded' ? defaultDedParams()
+    : kind === 'chaos' ? { ...defaultChaoticTrigParams(), preset: '' }
+    : defaultIndParams();
+  return {
+    color: data.color,
+    params: { ...defaults, ...params },
+    expressions,
+    track: data.track || undefined,
+  };
+}
+
+// Reflect state's display flags into the toolbar and scene after a load.
+function syncToolbarFromState() {
+  const setOn = (id, on) => { const el = document.getElementById(id); if (el) el.classList.toggle('on', !!on); };
+  setOn('btn_grid', state.showGrid);
+  cubeGroup.visible = !!state.showGrid;
+  document.querySelector('.canvas-wrap')?.classList.toggle('no-grid', !state.showGrid);
+  setOn('btn_axes', state.showAxes);
+  setOn('btn_shadow', state.showShadow);
+  const anim = document.getElementById('btn_anim');
+  if (anim) {
+    anim.classList.toggle('on', !!state.animate);
+    anim.textContent = state.animate ? '❚❚' : '▶';
+  }
+  const mode = document.getElementById('mode_ind');
+  if (mode) mode.textContent = state.animate ? 'auto-orbit' : 'orbit';
+  if (!Number.isFinite(state.axisLen) || state.axisLen < 0) state.axisLen = 2.6;
+  setAxisLen(state.axisLen);   // also rebuilds the axes and applies showAxes
+}
+
 function loadFullProject(project) {
   if (!project || project.format !== 'reasoning-paths-project') {
     alert('Not a valid Reasoning Paths project file.');
     return false;
   }
 
-  // Clear current scene objects
-  [dedGroup, indGroup, tracksRoot].forEach(g => clearGroup(g));
+  // Start from a truly empty scene: no cards, meshes, Beyond objects or
+  // running walks left over from before.
+  resetScene();
 
-  // Reset instance arrays
-  dedInstances.length = 0;
-  indInstances.length = 0;
-  chaosInstances.length = 0;
-  dedInstanceCounter = 0;
-  indInstanceCounter = 0;
-  chaosInstanceCounter = 0;
-  dedPrimaryDisposed = false;
-  indPrimaryDisposed = false;
-
-  // Restore core state
-  if (project.state) {
-    Object.assign(state, project.state);
-    // Re-apply vars safely
-    if (project.state.vars) state.vars = { ...project.state.vars };
-    if (project.state.expressions) state.expressions = { ...project.state.expressions };
+  const saved = project.state || {};
+  for (const k of RESTORABLE_STATE_KEYS) {
+    if (k in saved) state[k] = saved[k];
+  }
+  if (!Number.isInteger(state.seed)) state.seed = 0x42a1;
+  if (saved.vars && typeof saved.vars === 'object') {
+    for (const name of VAR_NAMES) {
+      const v = Number(saved.vars[name]);
+      if (Number.isFinite(v)) state.vars[name] = v;
+    }
   }
 
-  // Restore instances (primary first for each kind)
   const kinds = [
     { list: project.instances?.ded || [], kind: 'ded' },
     { list: project.instances?.ind || [], kind: 'ind' },
     { list: project.instances?.chaos || [], kind: 'chaos' },
   ];
-
-  kinds.forEach(({ list, kind }) => {
-    list.forEach((data) => {
-      const inst = makeInstance(kind, {
-        color: data.color,
-        params: data.params,
-        expressions: data.expressions,
-        track: data.track,
-      });
-      if (data.csvLabel) inst.csvLabel = data.csvLabel;
-
-      if (data.id > (kind === 'ded' ? dedInstanceCounter : kind === 'chaos' ? chaosInstanceCounter : indInstanceCounter)) {
-        if (kind === 'ded') dedInstanceCounter = data.id;
-        else if (kind === 'chaos') chaosInstanceCounter = data.id;
-        else indInstanceCounter = data.id;
-      }
-
-      // Make the card appear in the floating panel
-      if (typeof appendSecondaryCard === 'function' && !inst.isPrimary) {
-        try { appendSecondaryCard(inst); } catch(_) {}
-      }
-    });
-  });
-
-  // Try to restore beyond (if the beyond code is present)
-  try {
-    if (project.beyond && typeof addBeyond === 'function' && typeof refreshBeyondHosts === 'function') {
-      // Clear existing beyond
-      if (typeof paramInstances !== 'undefined') paramInstances.length = 0;
-      if (typeof implicitInstances !== 'undefined') implicitInstances.length = 0;
-      if (typeof vfieldInstances !== 'undefined') vfieldInstances.length = 0;
-      if (typeof volumeInstances !== 'undefined') volumeInstances.length = 0;
-
-      (project.beyond.param || []).forEach(d => {
-        const i = addBeyond('param'); if (d.params) Object.assign(i.params, d.params);
-      });
-      (project.beyond.implicit || []).forEach(d => {
-        const i = addBeyond('implicit'); if (d.params) Object.assign(i.params, d.params);
-      });
-      (project.beyond.vfield || []).forEach(d => {
-        const i = addBeyond('vfield'); if (d.params) Object.assign(i.params, d.params);
-      });
-      (project.beyond.volume || []).forEach(d => {
-        const i = addBeyond('volume'); if (d.params) Object.assign(i.params, d.params);
-      });
-      if (typeof refreshBeyondHosts === 'function') refreshBeyondHosts();
-      if (typeof rebuildBeyond === 'function') rebuildBeyond();
+  for (const { list, kind } of kinds) {
+    for (const data of list) {
+      if (!data || typeof data !== 'object') continue;
+      reserveInstanceId(kind, data.id);
+      const inst = makeInstance(kind, instanceOptsFromSave(kind, data, saved));
+      if (data.csvLabel) inst.csvLabel = String(data.csvLabel);
+      appendSecondaryCard(inst);
+      renderInstanceName(inst);
     }
-  } catch (e) {
-    console.warn('Beyond restore partial:', e);
   }
 
-  // Rebuild all visuals
+  // Beyond objects: create each with its saved params, then build cards and
+  // meshes once.
+  for (const kind of ['param', 'implicit', 'vfield', 'volume']) {
+    for (const d of (project.beyond?.[kind] || [])) {
+      makeBeyondInst(kind, { params: (d && d.params) || {} });
+    }
+  }
+  refreshBeyondHosts();
+  rebuildBeyond();
+
+  syncToolbarFromState();
+  renderVarsPanel();
+  recomputeExpressions();
   regenerate();
 
-  // Restore panel positions if present
   if (project.panelPositions) {
     Object.entries(project.panelPositions).forEach(([id, pos]) => {
       const el = document.getElementById(id);
@@ -6006,21 +6091,14 @@ function loadFullProject(project) {
         el.style.left = pos.left + 'px';
         el.style.top = pos.top + 'px';
         el.style.right = 'auto';
-        // Also persist so next reload keeps it
-        try { localStorage.setItem('rp_pos_' + id, JSON.stringify(pos)); } catch(_) {}
+        try { localStorage.setItem('rp_pos_' + id, JSON.stringify({ left: pos.left, top: pos.top })); } catch (_) {}
       }
     });
   }
 
-  // Refresh UI bits
-  if (typeof renderVarsPanel === 'function') renderVarsPanel();
-  if (typeof updateVarsActiveTag === 'function') updateVarsActiveTag();
-  if (typeof updateInstanceCounts === 'function') updateInstanceCounts();
-
-  // Refresh all instance cards (they were rebuilt by makeInstance)
-  // Simple approach: force a small regen of controls if needed
-  try { syncAllInstanceTrackTags?.(); } catch (_) {}
-
+  updateVarsActiveTag();
+  updateInstanceCounts();
+  syncAllInstanceTrackTags();
   return true;
 }
 
@@ -6062,56 +6140,49 @@ function loadProjectFromFile() {
 // ============================================================================
 // v7/v8: Clear canvas / New project (clean up everything)
 // ============================================================================
-function clearCanvas() {
-  // 1. Dispose and remove ALL instances (primaries + secondaries) for blank start
-  const allInsts = [...(dedInstances||[]), ...(indInstances||[]), ...(chaosInstances||[])];
-  allInsts.forEach(inst => {
+// Remove every instance, card, mesh, Beyond object and running walk, and
+// reset state to defaults. Shared by "Clear canvas" and project load.
+function resetScene() {
+  // Stop walks first so no tick writes into instances being torn down.
+  walkInstances.forEach(w => {
+    pauseInstance(w);
+    releaseAllOwnedBy(w, /*restore=*/false);
+    w.frame = 0; w.cycleIdx = 0; w.cycleFrame = 0;
+    if (w.statusEl) w.statusEl.textContent = 'idle';
+  });
+  masterSnapshot = null;
+  refreshAllHighlights();
+
+  [...dedInstances, ...indInstances, ...chaosInstances].forEach(inst => {
     try { disposeInstance(inst); } catch (e) {}
   });
-
-  // Force clear the arrays completely
   dedInstances.length = 0;
   indInstances.length = 0;
   chaosInstances.length = 0;
   dedInstanceCounter = 0;
   indInstanceCounter = 0;
   chaosInstanceCounter = 0;
+  // From here on every instance is an ordinary card with its own params;
+  // nothing is promoted to the legacy state-backed "primary".
   dedPrimaryDisposed = true;
   indPrimaryDisposed = true;
 
-  // 2. Remove every reasoning path card from the DOM (makes hosts empty, ready for fresh +Add)
+  // Cards may be docked in a panel or floating on <body>; floating ones
+  // leave a placeholder behind and have window-level drag listeners.
   document.querySelectorAll('.inst-card').forEach(card => {
-    try { card.remove(); } catch (e) {}
+    try { detachCardDrag(card); } catch (e) {}
+    card.remove();
   });
+  document.querySelectorAll('.inst-card-placeholder').forEach(ph => ph.remove());
 
-  // 3. Clear all 3D groups (paths + tracks + beyond) — this removes everything visible in the canvas
-  try {
-    const groupsToClear = [
-      dedGroup, indGroup, tracksRoot,
-      (typeof beyondParamGroup !== 'undefined' ? beyondParamGroup : null),
-      (typeof beyondImplicitGroup !== 'undefined' ? beyondImplicitGroup : null),
-      (typeof beyondVfieldGroup !== 'undefined' ? beyondVfieldGroup : null),
-      (typeof beyondVolumeGroup !== 'undefined' ? beyondVolumeGroup : null),
-    ].filter(Boolean);
+  [dedGroup, indGroup, tracksRoot].forEach(g => clearGroup(g));
 
-    groupsToClear.forEach(g => {
-      try { clearGroup(g); } catch (e) {}
-    });
-  } catch (e) {}
+  for (const list of [paramInstances, implicitInstances, vfieldInstances, volumeInstances]) {
+    [...list].forEach(inst => disposeBeyondInst(inst));
+  }
+  refreshBeyondHosts();
+  syncBeyondTag();
 
-  // 4. Clear beyond instance data
-  try {
-    if (typeof paramInstances !== 'undefined') paramInstances.length = 0;
-    if (typeof implicitInstances !== 'undefined') implicitInstances.length = 0;
-    if (typeof vfieldInstances !== 'undefined') vfieldInstances.length = 0;
-    if (typeof volumeInstances !== 'undefined') volumeInstances.length = 0;
-    if (typeof refreshBeyondHosts === 'function') refreshBeyondHosts();
-    if (typeof rebuildBeyond === 'function') rebuildBeyond();
-    // Force remove any lingering beyond UI cards
-    document.querySelectorAll('.beyond-card').forEach(c => { try { c.remove(); } catch(e){} });
-  } catch (e) {}
-
-  // 5. Reset global state + vars to clean defaults (so adding new things starts fresh)
   Object.assign(state, {
     start_x: 0, start_y: 0, start_z: 0,
     x_inc: 0, y_inc: 0, z_inc: 0.1, steps: 5, ded_polarity: 'up',
@@ -6123,31 +6194,14 @@ function clearCanvas() {
   });
   state.vars = { l: 1, m: 1, n: 1, p: 1, q: 1, r: 1, c: 1, d: 1 };
 
-  // 6. Update UI to reflect blank state (counts will be 00, panels empty)
-  if (typeof updateInstanceCounts === 'function') updateInstanceCounts();
-  if (typeof renderVarsPanel === 'function') renderVarsPanel();
-  if (typeof updateVarsActiveTag === 'function') updateVarsActiveTag();
+  updateInstanceCounts();
+  renderVarsPanel();
+  updateVarsActiveTag();
+}
 
-  // Try to clear any remaining primary control values (in case static inputs linger)
-  try {
-    const numFields = ['start_x','start_y','start_z','x_inc','y_inc','z_inc','steps',
-                       'start_r','start_theta','start_phi','theta_inc','phi_inc','sigma','iterations'];
-    numFields.forEach(fid => {
-      const inp = document.getElementById(fid);
-      const val = document.getElementById(fid + '_val');
-      if (inp) inp.value = (fid.includes('steps') || fid.includes('iterations')) ? '0' : '0';
-      if (val) val.textContent = (fid.includes('steps') || fid.includes('iterations')) ? '0' : '0.00';
-    });
-    document.querySelectorAll('#ded_polarity_tg button, #ind_polarity_tg button').forEach(b => b.classList.remove('on'));
-  } catch (e) {}
-
-  // 7. Rebuild the 3D scene — now completely blank (only environment remains)
+function clearCanvas() {
+  resetScene();
   regenerate();
-
-  // Extra safety: ensure no stray objects in main path groups
-  try {
-    [dedGroup, indGroup, tracksRoot].forEach(g => { if (g) clearGroup(g); });
-  } catch(e) {}
 
   // Clear autosave so next load is also blank
   try { localStorage.removeItem(AUTOSAVE_KEY); } catch (e) {}
@@ -6175,10 +6229,15 @@ function loadAutosavePref() {
   }
 }
 
+// When the last session was restored at startup; the status label keeps
+// saying "restored" for a moment so the user notices.
+let autosaveRestoredAt = 0;
+const recentlyRestored = () => performance.now() - autosaveRestoredAt < 2500;
+
 function updateAutosaveUI() {
   const el = document.getElementById('autosave_status');
   if (!el) return;
-  el.textContent = autosaveEnabled ? 'autosave' : 'autosave off';
+  el.textContent = !autosaveEnabled ? 'autosave off' : (recentlyRestored() ? 'restored' : 'autosave');
   el.style.opacity = autosaveEnabled ? '0.65' : '0.4';
 }
 
@@ -6205,7 +6264,7 @@ function scheduleAutosave() {
       const proj = serializeFullProject();
       localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(proj));
       const status = document.getElementById('autosave_status');
-      if (status) status.textContent = 'autosaved';
+      if (status && !recentlyRestored()) status.textContent = 'autosaved';
       setTimeout(() => { if (status) updateAutosaveUI(); }, 1100);
     } catch (e) {}
   }, 850);
@@ -6218,10 +6277,10 @@ function tryRestoreAutosave() {
     if (!raw) return false;
     const data = JSON.parse(raw);
     if (data && data.version >= 6 && (data.instances?.ded?.length || data.instances?.ind?.length || data.instances?.chaos?.length)) {
-      loadFullProject(data);
-      const status = document.getElementById('autosave_status');
-      if (status) status.textContent = 'restored';
-      setTimeout(() => { if (status) updateAutosaveUI(); }, 1600);
+      if (!loadFullProject(data)) return false;
+      autosaveRestoredAt = performance.now();
+      updateAutosaveUI();
+      setTimeout(updateAutosaveUI, 2600);
       return true;
     }
   } catch (_) {}
@@ -6370,11 +6429,12 @@ const presets = [
 let presetIdx = 0;
 document.getElementById('btn_preset').addEventListener('click', () => {
   presetIdx = (presetIdx+1) % presets.length;
-  Object.assign(state, presets[presetIdx]);
-  // reflect in UI
-  ['start_x','start_y','start_z','start_r','start_theta','start_phi'].forEach(id => {
-    document.getElementById(id).value = state[id];
-  });
+  const preset = presets[presetIdx];
+  Object.assign(state, preset);
+  // Primary cards (static markup) — may be gone after Clear canvas / load.
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  ['start_x','start_y','start_z','start_r','start_theta','start_phi'].forEach(id => setVal(id, state[id]));
   [['x_inc','x_inc_val',v=>v.toFixed(2)],
    ['y_inc','y_inc_val',v=>v.toFixed(2)],
    ['z_inc','z_inc_val',v=>v.toFixed(2)],
@@ -6383,12 +6443,30 @@ document.getElementById('btn_preset').addEventListener('click', () => {
    ['phi_inc','phi_inc_val',v=>v.toFixed(3)],
    ['sigma','sigma_val',v=>v.toFixed(2)],
    ['iterations','iterations_val',v=>String(v)]].forEach(([id,vid,fn]) => {
-    document.getElementById(id).value = state[id];
-    document.getElementById(vid).textContent = fn(state[id]);
+    setVal(id, state[id]);
+    setText(vid, fn(state[id]));
   });
-  // toggles
   document.querySelectorAll('#ded_polarity_tg button').forEach(b=>b.classList.toggle('on', b.dataset.val===state.ded_polarity));
   document.querySelectorAll('#ind_polarity_tg button').forEach(b=>b.classList.toggle('on', b.dataset.val===state.ind_polarity));
+  // Without a primary card (after Clear canvas or a project load), apply
+  // the preset to the first deductive / inductive card instead, skipping
+  // ƒx-bound fields.
+  for (const [list, keys, polKey] of [[dedInstances, DED_PARAM_KEYS, 'ded_polarity'],
+                                      [indInstances, IND_PARAM_KEYS, 'ind_polarity']]) {
+    const first = list.find(i => i.step_rule !== 'parametric');
+    if (!first || first.isPrimary) continue;
+    const exprs = first.expressions || {};
+    for (const k of keys) {
+      if (!(k in preset) || exprs[k]) continue;
+      first.params[k] = preset[k];
+      if (k === polKey) {
+        const tg = document.querySelector(`[data-toggle-key="${k}"][data-suffix="${suffixOf(first)}"]`);
+        if (tg) tg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.val === preset[k]));
+      } else {
+        setSecondaryFieldDisplay(first, k, preset[k]);
+      }
+    }
+  }
   // re-apply any active expressions so ƒx-bound fields stay bound
   recomputeExpressions();
   regenerate();
@@ -6812,8 +6890,9 @@ function generateCreativeExpressions(theme) {
   return { defs, x, y, z };
 }
 
-// Autosave restore is opt-in only now (user enables via clicking the status label).
-// tryRestoreAutosave() is only called when autosaveEnabled === true (inside loadAutosavePref + manual toggle).
+// Autosave is opt-in (click the status label). When it is on, the last
+// session is restored at startup via tryRestoreAutosave() near the end of
+// this script.
 
 // ---------- Random walk engine (multi-instance, multi-parameter) ----------
 // Multiple independent walk "instances" can run simultaneously, each with its
@@ -7419,7 +7498,7 @@ function tickInstance(inst) {
         const off = cur - inst.anchor[p];
         next = inst.anchor[p] + off * (1 - pull) + walkNoise() * stepMag;
       }
-      if (INT_PARAMS.has(p)) next = Math.max(1, Math.round(next));
+      if (INT_PARAMS.has(p)) next = clampCount(next, MAX_PATH_POINTS);
       writeParam(p, next);
       syncParamUI(p);
     });
@@ -10069,6 +10148,9 @@ new ResizeObserver(resize).observe(canvas);
 resize();
 regenerate();
 animate();
+
+// Opt-in autosave: if the user turned autosave on, reopen their last session.
+tryRestoreAutosave();
 
 // v9 welcome: if nothing was auto-restored and we have almost no instances,
 // seed a small complex chaotic scene.
